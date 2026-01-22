@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: whoop-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: WHOOP_CLIENT_ID
+        sync: false
+      - key: WHOOP_CLIENT_SECRET
+        sync: false
+      - key: WHOOP_REDIRECT_URI
+        sync: false
+      - key: APP_REDIRECT_URI
+        value: nutrogen://whoop/callback
+      - key: WHOOP_API_BASE_URL
+        value: https://api.prod.whoop.com
+    healthCheckPath: /health
