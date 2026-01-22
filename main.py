@@ -362,8 +362,15 @@ def generate_state() -> str:
 
 
 async def refresh_token_if_needed(user_id: str) -> Optional[str]:
-    """Refresh the access token if expired."""
+    """
+    Refresh the access token if expired.
+    
+    IMPORTANT: WHOOP uses Refresh Token Rotation. When we refresh,
+    WHOOP invalidates the old refresh token and sends a new one.
+    We MUST save the new refresh token or the user will be logged out.
+    """
     if user_id not in token_store:
+        logger.warning(f"[Token Refresh] No token found for user {user_id}")
         return None
     
     token_data = token_store[user_id]
@@ -373,9 +380,14 @@ async def refresh_token_if_needed(user_id: str) -> Optional[str]:
     if expires_at and datetime.fromisoformat(expires_at) > datetime.utcnow() + timedelta(minutes=5):
         return token_data["access_token"]
     
-    # Refresh the token
+    # Token expired, need to refresh
+    logger.info(f"[Token Refresh] Token expired for user {user_id}, refreshing...")
+    
     refresh_token = token_data.get("refresh_token")
     if not refresh_token:
+        logger.error(f"[Token Refresh] No refresh token for user {user_id} - user must re-authenticate")
+        # Remove invalid token data
+        del token_store[user_id]
         return None
     
     async with httpx.AsyncClient() as client:
@@ -390,18 +402,30 @@ async def refresh_token_if_needed(user_id: str) -> Optional[str]:
         )
         
         if response.status_code != 200:
-            logger.error(f"Token refresh failed: {response.text}")
+            logger.error(f"[Token Refresh] Failed for user {user_id}: {response.text}")
+            # Token is invalid, remove it so user can re-authenticate
+            del token_store[user_id]
             return None
         
         data = response.json()
         expires_in = data.get("expires_in", 3600)
         
+        # CRITICAL: Save the NEW refresh token (Token Rotation)
+        new_refresh_token = data.get("refresh_token")
+        if new_refresh_token:
+            logger.info(f"[Token Refresh] Got new refresh token for user {user_id}")
+        else:
+            logger.warning(f"[Token Refresh] No new refresh token in response for user {user_id}, keeping old one")
+            new_refresh_token = refresh_token
+        
         token_store[user_id] = {
             "access_token": data["access_token"],
-            "refresh_token": data.get("refresh_token", refresh_token),
+            "refresh_token": new_refresh_token,
             "expires_at": (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat(),
             "whoop_user_id": token_data.get("whoop_user_id"),
         }
+        
+        logger.info(f"[Token Refresh] Successfully refreshed token for user {user_id}, expires in {expires_in}s")
         
         return data["access_token"]
 
@@ -535,8 +559,8 @@ async def get_auth_url(request: AuthUrlRequest):
     state = generate_state()
     state_store[state] = request.user_id
     
-    # WHOOP OAuth scopes
-    scopes = "read:recovery read:sleep read:workout read:cycles read:profile read:body_measurement"
+    # WHOOP OAuth scopes - MUST include 'offline' for refresh tokens
+    scopes = "read:recovery read:sleep read:workout read:cycles read:profile read:body_measurement offline"
     
     params = {
         "client_id": WHOOP_CLIENT_ID,
@@ -594,6 +618,13 @@ async def oauth_callback_redirect(
         
         data = response.json()
         expires_in = data.get("expires_in", 3600)
+        refresh_token = data.get("refresh_token")
+        
+        # Log if we got a refresh token (requires 'offline' scope)
+        if refresh_token:
+            logger.info(f"[OAuth Callback GET] Got refresh token for user {user_id} - offline scope working!")
+        else:
+            logger.warning(f"[OAuth Callback GET] NO refresh token for user {user_id} - check if 'offline' scope is included!")
         
         # Get WHOOP user profile
         profile_response = await client.get(
@@ -609,12 +640,12 @@ async def oauth_callback_redirect(
         # Store tokens
         token_store[user_id] = {
             "access_token": data["access_token"],
-            "refresh_token": data.get("refresh_token"),
+            "refresh_token": refresh_token,
             "expires_at": (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat(),
             "whoop_user_id": whoop_user_id,
         }
         
-        logger.info(f"Successfully connected WHOOP for user {user_id}")
+        logger.info(f"Successfully connected WHOOP for user {user_id}, has_refresh_token={refresh_token is not None}")
         
         # Redirect to mobile app with success
         success_params = urlencode({
@@ -656,6 +687,13 @@ async def oauth_callback_manual(request: CallbackRequest):
         
         data = response.json()
         expires_in = data.get("expires_in", 3600)
+        refresh_token = data.get("refresh_token")
+        
+        # Log if we got a refresh token (requires 'offline' scope)
+        if refresh_token:
+            logger.info(f"[OAuth Callback POST] Got refresh token for user {user_id} - offline scope working!")
+        else:
+            logger.warning(f"[OAuth Callback POST] NO refresh token for user {user_id} - check if 'offline' scope is included!")
         
         # Get WHOOP user profile
         profile_response = await client.get(
@@ -671,10 +709,12 @@ async def oauth_callback_manual(request: CallbackRequest):
         # Store tokens
         token_store[user_id] = {
             "access_token": data["access_token"],
-            "refresh_token": data.get("refresh_token"),
+            "refresh_token": refresh_token,
             "expires_at": (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat(),
             "whoop_user_id": whoop_user_id,
         }
+        
+        logger.info(f"Successfully connected WHOOP for user {user_id}, has_refresh_token={refresh_token is not None}")
         
         return CallbackResponse(
             success=True,
